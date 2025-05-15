@@ -1,0 +1,288 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <DHT.h>
+#include <HTTPClient.h>  // ← restored
+
+// Sensor Pins
+#define DHTPIN 21
+#define DHTTYPE DHT11
+#define PIR_PIN 22
+#define TRIG_PIN 18
+#define ECHO_PIN 19
+#define MQ135_PIN 34
+#define MQ6_PIN 35
+
+// Fan Motor Control (L298N)
+#define FAN_IN1 25
+#define FAN_IN2 26
+#define FAN_PWM 27
+
+// LED Alert
+#define ALERT_LED 23
+
+// WiFi Credentials
+const char* ssid = "Aditya's Galaxy F23 5G";
+const char* password = "12345678";
+
+
+String botToken = "7656805521:AAGoCOI-UV5EZj_lLddfS-StShstalHbQTw";  // Replace with your Bot Token
+String chatID = "6837514414";      // Replace with your Chat ID
+
+// ThingSpeak API Key and URL  ← restored
+String tsUrl = "http://api.thingspeak.com/update?api_key=WI6QOAHG8S7AMYP4";
+
+// Initialize DHT sensor
+DHT dht(DHTPIN, DHTTYPE);
+
+// Web server on port 80
+WebServer server(80);
+
+// Thresholds (default values)
+float tempThreshold     = 30.0;
+float humidityThreshold = 70.0;
+int gasHighThreshold    = 500;
+int gasMediumThreshold  = 400;
+int distanceThreshold   = 100;
+
+// Manual override values
+bool  manualOverride = false;
+float manualTemp     = 0;
+float manualHum      = 0;
+int   manualMQ135    = 0;
+int   manualMQ6      = 0;
+int   manualFanSpeed = 0;
+
+unsigned long lastMotionTime = 0;
+const unsigned long timeout = 2000; // 2s
+bool airWasBadWithPerson = false;
+int  fanSpeed = 0;
+
+// PWM Settings
+#define FAN_PWM_CHANNEL 0
+#define PWM_FREQ        1000
+#define PWM_RESOLUTION  8  // 0–255
+
+void setup() {
+  Serial.begin(9600);
+  dht.begin();
+
+  pinMode(PIR_PIN, INPUT);
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  pinMode(FAN_IN1, OUTPUT);
+  pinMode(FAN_IN2, OUTPUT);
+  pinMode(FAN_PWM, OUTPUT);
+
+  pinMode(ALERT_LED, OUTPUT);
+
+  ledcSetup(FAN_PWM_CHANNEL, PWM_FREQ, PWM_RESOLUTION);
+  ledcAttachPin(FAN_PWM, FAN_PWM_CHANNEL);
+  stopFan();
+
+  // Connect WiFi
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print('.');
+  }
+  Serial.println();
+  Serial.print("Connected. IP = ");
+  Serial.println(WiFi.localIP());
+
+  // Web routes
+  server.on("/",    handleRoot);
+  server.on("/set", handleSet);
+  server.on("/reset",handleReset);
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();
+
+  bool alreadySent = false;
+  bool person = detectPerson();
+  float temp = dht.readTemperature();
+  float hum  = dht.readHumidity();
+  int   mq135 = analogRead(MQ135_PIN);
+  int   mq6   = analogRead(MQ6_PIN);
+
+  // Manual override branch
+  if (manualOverride) {
+    temp     = manualTemp;
+    hum      = manualHum;
+    mq135    = manualMQ135;
+    mq6      = manualMQ6;
+    fanSpeed = manualFanSpeed;
+    controlFanManual();
+
+    sendDataToThingSpeak(temp, hum, mq6, mq135, person, fanSpeed);
+    return;
+  }
+
+  // Automatic logic
+  bool gasLeak = (mq135 > gasHighThreshold || mq6 > gasHighThreshold);
+  bool airBad  = (temp > tempThreshold || hum > humidityThreshold ||
+                  mq135 > gasMediumThreshold || mq6 > gasMediumThreshold);
+  bool airNormal = (!gasLeak && !airBad);
+
+  if (gasLeak && !alreadySent) {
+  sendTelegramAlert("⚠ ALERT: Dangerous Gas Leak detected!");
+  alreadySent = true;
+}
+else if (!gasLeak) {
+  alreadySent = false;
+}
+  
+  if (gasLeak) {
+    runFanHigh();
+    digitalWrite(ALERT_LED, HIGH);
+    airWasBadWithPerson = true;
+    Serial.println("⚠ GAS LEAK DETECTED! Fan HIGH");
+  }
+  else {
+    digitalWrite(ALERT_LED, LOW);
+    if (person && airBad) {
+      airWasBadWithPerson = true;
+      runFanMedium();
+      Serial.println("🟡 Person + bad air. Fan MEDIUM");
+    }
+    else if (airWasBadWithPerson && !airNormal) {
+      runFanMedium();
+      Serial.println("🟠 Holding fan due to earlier bad air. Fan MEDIUM");
+    }
+    else {
+      airWasBadWithPerson = false;
+      stopFan();
+      Serial.println("🟢 Normal air. Fan OFF");
+    }
+  }
+
+  Serial.print("Temp: "); Serial.print(temp); Serial.print(" °C, ");
+  Serial.print("Hum: ");  Serial.print(hum);  Serial.print(" %, ");
+  Serial.print("MQ135: ");Serial.print(mq135);Serial.print(", ");
+  Serial.print("MQ6: ");  Serial.print(mq6);  Serial.print(", ");
+  Serial.print("Fan: ");  Serial.println(fanSpeed);
+
+  sendDataToThingSpeak(temp, hum, mq6, mq135, person, fanSpeed);
+  delay(1000);
+}
+
+// ========== Web Handlers ==========
+
+void handleRoot() {
+  String page = "<h1>Smart Ventilation System</h1>";
+  page += "<form action='/set' method='GET'>";
+  page += "Temp (°C): <input type='number' step='0.1' name='temp'><br>";
+  page += "Hum (%): <input type='number' step='0.1' name='hum'><br>";
+  page += "MQ135: <input type='number' name='mq135'><br>";
+  page += "MQ6: <input type='number' name='mq6'><br>";
+  page += "Fan Speed (0–255): <input type='number' name='fan'><br>";
+  page += "<input type='submit' value='Apply Manual Override'>";
+  page += "</form><br>";
+  page += "<a href='/reset'><button>Reset to Auto Mode</button></a>";
+  server.send(200, "text/html", page);
+}
+
+void handleSet() {
+  if (server.hasArg("temp"))  manualTemp     = server.arg("temp").toFloat();
+  if (server.hasArg("hum"))   manualHum      = server.arg("hum").toFloat();
+  if (server.hasArg("mq135")) manualMQ135    = server.arg("mq135").toInt();
+  if (server.hasArg("mq6"))   manualMQ6      = server.arg("mq6").toInt();
+  if (server.hasArg("fan"))   manualFanSpeed = server.arg("fan").toInt();
+  manualOverride = true;
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void handleReset() {
+  manualOverride = false;
+  manualTemp = manualHum = manualMQ135 = manualMQ6 = manualFanSpeed = 0;
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+// ========== Sensor & Fan Routines ==========
+
+bool detectPerson() {
+  bool pir_ok = digitalRead(PIR_PIN);
+  bool us_ok  = (getDistance() < distanceThreshold);
+  if (pir_ok || us_ok) {
+    lastMotionTime = millis();
+    return true;
+  }
+  return (millis() - lastMotionTime < timeout);
+}
+
+long getDistance() {
+  digitalWrite(TRIG_PIN, LOW);  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH); delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  long dur = pulseIn(ECHO_PIN, HIGH);
+  return dur * 0.0343 / 2;
+}
+
+void runFanHigh() {
+  digitalWrite(FAN_IN1, HIGH);
+  digitalWrite(FAN_IN2, LOW);
+  fanSpeed = 255;
+  ledcWrite(FAN_PWM_CHANNEL, fanSpeed);
+}
+
+void runFanMedium() {
+  digitalWrite(FAN_IN1, HIGH);
+  digitalWrite(FAN_IN2, LOW);
+  fanSpeed = 150;
+  ledcWrite(FAN_PWM_CHANNEL, fanSpeed);
+}
+
+void stopFan() {
+  digitalWrite(FAN_IN1, LOW);
+  digitalWrite(FAN_IN2, LOW);
+  fanSpeed = 0;
+  ledcWrite(FAN_PWM_CHANNEL, fanSpeed);
+}
+
+void controlFanManual() {
+  if (manualFanSpeed > 0) {
+    digitalWrite(FAN_IN1, HIGH);
+    digitalWrite(FAN_IN2, LOW);
+    ledcWrite(FAN_PWM_CHANNEL, manualFanSpeed);
+  } else {
+    stopFan();
+  }
+}
+
+// ========== ThingSpeak Integration ==========
+
+void sendDataToThingSpeak(float t, float h, int mq6v, int mq135v, bool person, int fSpeed) {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    String fullUrl = tsUrl + "&field1=" + String(t)
+                   + "&field2=" + String(h)
+                   + "&field3=" + String(mq6v)
+                   + "&field4=" + String(mq135v)
+                   + "&field5=" + String(person ? 1 : 0)
+                   + "&field6=" + String(fSpeed);
+    http.begin(fullUrl);
+    int code = http.GET();
+    Serial.print("TS response: "); Serial.println(code);
+    http.end();
+  }
+}
+
+void sendTelegramAlert(String message) {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    String url = "https://api.telegram.org/bot" + botToken + "/sendMessage?chat_id=" + chatID + "&text=" + message;
+    http.begin(url);
+    int httpCode = http.GET();
+    if (httpCode > 0) {
+      Serial.println("Telegram alert sent.");
+    } else {
+      Serial.println("Telegram alert failed.");
+    }
+    http.end();
+  }
+}
